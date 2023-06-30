@@ -26,6 +26,7 @@ APPS = \
 	biosnoop \
 	biostacks \
 	bitesize \
+	branches \
 	cachestat \
 	cpudist \
 	cpufreq \

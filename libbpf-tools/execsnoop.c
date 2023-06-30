@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <linux/perf_event.h>
+#include <asm/unistd.h>
 #include "execsnoop.h"
 #include "execsnoop.skel.h"
 #include "btf_helpers.h"
@@ -155,23 +157,6 @@ static void sig_int(int signo)
 	exiting = 1;
 }
 
-static void time_since_start()
-{
-	long nsec, sec;
-	static struct timespec cur_time;
-	double time_diff;
-
-	clock_gettime(CLOCK_MONOTONIC, &cur_time);
-	nsec = cur_time.tv_nsec - start_time.tv_nsec;
-	sec = cur_time.tv_sec - start_time.tv_sec;
-	if (nsec < 0) {
-		nsec += NSEC_PER_SEC;
-		sec--;
-	}
-	time_diff = sec + (double)nsec / NSEC_PER_SEC;
-	printf("%-8.3f", time_diff);
-}
-
 static void inline quoted_symbol(char c) {
 	switch(c) {
 		case '"':
@@ -192,78 +177,55 @@ static void inline quoted_symbol(char c) {
 	}
 }
 
-static void print_args(const struct event *e, bool quote)
-{
-	int i, args_counter = 0;
-
-	if (env.quote)
-		putchar('"');
-
-	for (i = 0; i < e->args_size && args_counter < e->args_count; i++) {
-		char c = e->args[i];
-
-		if (env.quote) {
-			if (c == '\0') {
-				args_counter++;
-				putchar('"');
-				putchar(' ');
-				if (args_counter < e->args_count) {
-					putchar('"');
-				}
-			} else {
-				quoted_symbol(c);
-			}
-		} else {
-			if (c == '\0') {
-				args_counter++;
-				putchar(' ');
-			} else {
-				putchar(c);
-			}
-		}
-	}
-	if (e->args_count == env.max_args + 1) {
-		fputs(" ...", stdout);
-	}
-}
-
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
 	const struct event *e = data;
-	time_t t;
-	struct tm *tm;
-	char ts[32];
+    int i;
 
-	/* TODO: use pcre lib */
-	if (env.name && strstr(e->comm, env.name) == NULL)
-		return;
-
-	/* TODO: use pcre lib */
-	if (env.line && strstr(e->comm, env.line) == NULL)
-		return;
-
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-
-	if (env.time) {
-		printf("%-8s ", ts);
-	}
-	if (env.timestamp) {
-		time_since_start();
-	}
-
-	if (env.print_uid)
-		printf("%-6d", e->uid);
-
-	printf("%-16s %-6d %-6d %3d ", e->comm, e->pid, e->ppid, e->retval);
-	print_args(e, env.quote);
-	putchar('\n');
+    for (i = 0; i < sizeof(e->entries) / sizeof(e->entries[0]); i++) {
+        if (!e->entries[i].to) {
+            break;
+        }
+        printf("0x%016lx\n", e->entries[i].to);
+    }
+    printf("\n");
 }
 
 static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
 {
 	fprintf(stderr, "Lost %llu events on CPU #%d!\n", lost_cnt, cpu);
+}
+
+static int cpu_cnt;
+static int *pfd_array;
+static int create_perf_events(void)
+{
+	struct perf_event_attr attr = {0};
+	int cpu;
+
+	/* create perf event */
+	attr.size = sizeof(attr);
+	attr.type = PERF_TYPE_RAW;
+	attr.config = 0x1b00;
+	attr.sample_type = PERF_SAMPLE_BRANCH_STACK;
+	attr.branch_sample_type = PERF_SAMPLE_BRANCH_KERNEL |
+		PERF_SAMPLE_BRANCH_USER | PERF_SAMPLE_BRANCH_ANY;
+
+	cpu_cnt = libbpf_num_possible_cpus();
+	pfd_array = malloc(sizeof(int) * cpu_cnt);
+	if (!pfd_array) {
+		cpu_cnt = 0;
+		return 1;
+	}
+
+	for (cpu = 0; cpu < cpu_cnt; cpu++) {
+		pfd_array[cpu] = syscall(__NR_perf_event_open, &attr,
+					 -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+		if (pfd_array[cpu] < 0)
+			break;
+	}
+
+	return cpu == 0;
 }
 
 int main(int argc, char **argv)
@@ -277,13 +239,11 @@ int main(int argc, char **argv)
 	struct perf_buffer *pb = NULL;
 	struct execsnoop_bpf *obj;
 	int err;
-	int idx, cg_map_fd;
-	int cgfd = -1;
-
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
 
+    create_perf_events();
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
@@ -299,31 +259,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* initialize global data (filtering options) */
-	obj->rodata->ignore_failed = !env.fails;
-	obj->rodata->targ_uid = env.uid;
-	obj->rodata->max_args = env.max_args;
-	obj->rodata->filter_cg = env.cg;
-
 	err = execsnoop_bpf__load(obj);
 	if (err) {
 		fprintf(stderr, "failed to load BPF object: %d\n", err);
 		goto cleanup;
-	}
-
-	/* update cgroup path fd to map */
-	if (env.cg) {
-		idx = 0;
-		cg_map_fd = bpf_map__fd(obj->maps.cgroup_map);
-		cgfd = open(env.cgroupspath, O_RDONLY);
-		if (cgfd < 0) {
-			fprintf(stderr, "Failed opening Cgroup path: %s", env.cgroupspath);
-			goto cleanup;
-		}
-		if (bpf_map_update_elem(cg_map_fd, &idx, &cgfd, BPF_ANY)) {
-			fprintf(stderr, "Failed adding target cgroup to map");
-			goto cleanup;
-		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -375,8 +314,6 @@ cleanup:
 	perf_buffer__free(pb);
 	execsnoop_bpf__destroy(obj);
 	cleanup_core_btf(&open_opts);
-	if (cgfd > 0)
-		close(cgfd);
 
 	return err != 0;
 }
